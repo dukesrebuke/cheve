@@ -5,26 +5,21 @@
   import HistoryItem from "./HistoryItem.svelte";
   import Pagination from "./Pagination.svelte";
   import { slide } from "svelte/transition";
+  import { get } from "svelte/store";
 
   let open = true;
   let lastDoc: any = null;
   let hasMore = false;
 
-  let $history;
-  let $userId;
-
-  history.subscribe((v) => ($history = v));
-  userId.subscribe((v) => ($userId = v));
-
   async function loadInitial() {
-    const result = await fetchTranslations($userId);
+    const result = await fetchTranslations(get(userId));
     history.set(result.docs.map((d) => ({ id: d.id, ...d.data() })));
     lastDoc = result.lastDoc;
     hasMore = !!result.lastDoc;
   }
 
   async function loadMore() {
-    const result = await fetchTranslations($userId, 10, lastDoc);
+    const result = await fetchTranslations(get(userId), 10, lastDoc);
     history.update((h) => [
       ...h,
       ...result.docs.map((d) => ({ id: d.id, ...d.data() }))
