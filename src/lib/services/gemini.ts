@@ -3,6 +3,18 @@ const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemi
 
 export type TranslationMode = 'en-paisa' | 'en-boricua' | 'paisa-boricua';
 
+export interface WordAnnotation {
+  word: string;
+  meaning: string;
+  note: string;
+}
+
+export interface TranslationExplanation {
+  context: string;
+  tone: string;
+  annotations: WordAnnotation[];
+}
+
 const SYSTEM_PROMPTS: Record<TranslationMode, string> = {
   'en-paisa': `You are a translator specializing in Colombian Paisa dialect (Antioquia region). 
 Translate the input from standard English into authentic Paisa Spanish slang and expressions.
@@ -20,30 +32,36 @@ Preserve the meaning and tone but use Boricua expressions instead of Paisa ones.
 Return ONLY the translated text, nothing else.`
 };
 
-export async function translateText(text: string, mode: TranslationMode): Promise<string> {
+const EXPLANATION_PROMPT = (mode: TranslationMode, input: string, output: string) =>
+  `You are a cultural linguist. Respond with exactly 3 lines. Each line must be complete on a single line with no line breaks within it. No markdown. No asterisks. No numbering.
+
+Here is a completed example of the exact format:
+CONTEXT: Medellín street life where loyalty and hustle define every word. (warm, street-level)
+WORD1: parcero - close friend or ally - the cornerstone of Paisa identity, implying deep mutual trust.
+WORD2: chimba - something excellent or beautiful - used to express admiration, can also be an insult depending on tone.
+
+Now do the same for this translation:
+Mode: ${mode}
+Original: "${input}"
+Translation: "${output}"
+
+CONTEXT:`;
+
+async function callGemini(prompt: string, maxTokens = 1024): Promise<string> {
   if (!GEMINI_API_KEY) {
     throw new Error('VITE_GEMINI_API_KEY is not set in environment variables.');
   }
 
-  const systemPrompt = SYSTEM_PROMPTS[mode];
-
-  const body = {
-    contents: [
-      {
-        role: 'user',
-        parts: [{ text: `${systemPrompt}\n\nTranslate this:\n${text}` }]
-      }
-    ],
-    generationConfig: {
-      temperature: 0.7,
-      maxOutputTokens: 1024
-    }
-  };
-
   const response = await fetch(GEMINI_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
+    body: JSON.stringify({
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      generationConfig: {
+        temperature: 0.3, // lower = more obedient formatting
+        maxOutputTokens: maxTokens
+      }
+    })
   });
 
   if (!response.ok) {
@@ -53,10 +71,56 @@ export async function translateText(text: string, mode: TranslationMode): Promis
 
   const data = await response.json();
   const result = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!result) throw new Error('Gemini returned an empty response.');
+  return result.trim();
+}
 
-  if (!result) {
-    throw new Error('Gemini returned an empty response.');
+export async function translateText(text: string, mode: TranslationMode): Promise<string> {
+  return callGemini(`${SYSTEM_PROMPTS[mode]}\n\nTranslate this:\n${text}`, 1024);
+}
+
+export async function explainTranslation(
+  input: string,
+  output: string,
+  mode: TranslationMode
+): Promise<TranslationExplanation> {
+  await new Promise(r => setTimeout(r, 2000));
+
+  const raw = await callGemini(EXPLANATION_PROMPT(mode, input, output), 800);
+
+  // strip all markdown: asterisks, hashes, backticks
+  const cleaned = raw
+    .replace(/[*_`#]/g, '')
+    .split('\n')
+    .map(l => l.trim())
+    .filter(Boolean);
+
+  console.log('[EXPLANATION CLEANED]', cleaned);
+
+  // find lines by prefix — works regardless of what else Gemini adds
+  const contextLine = cleaned.find(l => l.toUpperCase().startsWith('CONTEXT')) ?? '';
+  const word1Line   = cleaned.find(l => l.toUpperCase().startsWith('WORD1'))   ?? '';
+  const word2Line   = cleaned.find(l => l.toUpperCase().startsWith('WORD2'))   ?? '';
+
+  // parse context: everything after "CONTEXT:" 
+  const contextBody = contextLine.replace(/^CONTEXT\s*:\s*/i, '').trim();
+  const toneMatch   = contextBody.match(/\(([^)]+)\)\s*$/);
+  const tone        = toneMatch ? toneMatch[1] : 'colloquial';
+  const context     = contextBody.replace(/\([^)]+\)\s*$/, '').trim();
+
+  // parse word lines: "WORD1: term - meaning - note"
+  function parseWordLine(line: string): WordAnnotation {
+    const body  = line.replace(/^WORD\d\s*:\s*/i, '').trim();
+    // split on em-dash, en-dash, or hyphen surrounded by spaces
+    const parts = body.split(/\s*[—–]\s*|\s+-\s+/).map(s => s.trim());
+    const [word = '', meaning = '', ...noteParts] = parts;
+    return { word, meaning, note: noteParts.join(' - ').trim() };
   }
 
-  return result.trim();
+  const annotations: WordAnnotation[] = [word1Line, word2Line]
+    .filter(Boolean)
+    .map(parseWordLine)
+    .filter(a => a.word && a.meaning);
+
+  return { context, tone, annotations };
 }
