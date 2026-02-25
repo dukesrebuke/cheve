@@ -7,13 +7,10 @@ import type { TranslationMode } from './services/gemini';
 function createUserIdStore() {
   const STORAGE_KEY = 'cheve_user_id';
 
-  function generateId(): string {
-    return crypto.randomUUID();
-  }
-
   let initialId: string;
   if (typeof window !== 'undefined') {
-    initialId = localStorage.getItem(STORAGE_KEY) ?? generateId();
+    const stored = localStorage.getItem(STORAGE_KEY);
+    initialId = stored ?? crypto.randomUUID();
     localStorage.setItem(STORAGE_KEY, initialId);
   } else {
     initialId = 'ssr-placeholder';

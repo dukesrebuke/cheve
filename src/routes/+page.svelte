@@ -1,7 +1,10 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import { get } from 'svelte/store';
-  import { translateText, explainTranslation, type TranslationMode, type TranslationExplanation } from '$lib/services/gemini';
+  import {
+    translateText, explainTranslation,
+    type TranslationMode, type TranslationDirection, type TranslationExplanation
+  } from '$lib/services/gemini';
   import { saveTranslation, getTranslations, type Translation } from '$lib/services/firestore';
   import {
     userId, inputText, outputText, selectedMode, isTranslating,
@@ -9,26 +12,58 @@
     sidebarOpen, toasts, addToast
   } from '$lib/stores';
 
-  const MODES: { value: TranslationMode; label: string }[] = [
-    { value: 'en-paisa',     label: 'English → Paisa'   },
-    { value: 'en-boricua',   label: 'English → Boricua' },
-    { value: 'paisa-boricua',label: 'Paisa → Boricua'   }
+  // ── Mode + direction state ────────────────────────────
+  interface ModeConfig {
+    value: TranslationMode;
+    forward: string;
+    reverse: string;
+  }
+
+  const MODES: ModeConfig[] = [
+    { value: 'en-paisa',      forward: 'English',  reverse: 'Paisa'    },
+    { value: 'en-boricua',    forward: 'English',  reverse: 'Boricua'  },
+    { value: 'paisa-boricua', forward: 'Paisa',    reverse: 'Boricua'  }
   ];
 
-  // Explanation state
-  let explanation         = $state<TranslationExplanation | null>(null);
-  let explanationVisible  = $state(false);
-  let explanationLoading  = $state(false);
+  let activeMode      = $state<TranslationMode>('en-paisa');
+  let direction       = $state<TranslationDirection>('forward');
+  let swapping        = $state(false);
 
-  // History preview state
+  function selectMode(mode: TranslationMode) {
+    if (activeMode === mode) return;
+    activeMode = mode;
+    direction  = 'forward';
+    selectedMode.set(mode);
+  }
+
+  async function swapDirection() {
+    swapping  = true;
+    direction = direction === 'forward' ? 'reverse' : 'forward';
+    await new Promise(r => setTimeout(r, 350));
+    swapping  = false;
+  }
+
+  function currentLabels(): { from: string; to: string } {
+    const m = MODES.find(m => m.value === activeMode)!;
+    return direction === 'forward'
+      ? { from: m.forward, to: m.reverse }
+      : { from: m.reverse, to: m.forward };
+  }
+
+  // ── Explanation state ─────────────────────────────────
+  let explanation        = $state<TranslationExplanation | null>(null);
+  let explanationVisible = $state(false);
+  let explanationLoading = $state(false);
+
+  // ── Preview state ─────────────────────────────────────
   let previewItem    = $state<Translation | null>(null);
   let previewVisible = $state(false);
   let restoring      = $state(false);
 
-  // ── History ──────────────────────────────────────────
+  // ── History ───────────────────────────────────────────
   async function loadHistory(reset = false) {
     const uid = get(userId);
-    if (!uid) return;
+    if (!uid || uid === 'ssr-placeholder') return;
     historyLoading.set(true);
     try {
       const cursor = reset ? null : get(historyCursor);
@@ -47,27 +82,18 @@
   // ── Translation ───────────────────────────────────────
   async function handleTranslate() {
     const input = get(inputText).trim();
-    const mode  = get(selectedMode);
     const uid   = get(userId);
     if (!input) { addToast('Please enter some text to translate.', 'info'); return; }
 
-    // reset
     isTranslating.set(true);
     outputText.set('');
     explanation        = null;
     explanationVisible = false;
 
     try {
-      const result = await translateText(input, mode);
+      const result = await translateText(input, activeMode, direction);
       outputText.set(result);
-
-      const saved = await saveTranslation(uid, input, result, mode);
-      historyItems.update(items => [saved, ...items]);
-      addToast('Translation saved!', 'success');
-
-      // fire explanation after a beat — feels natural, not racing
-      fetchExplanation(input, result, mode);
-
+      fetchAndSave(input, result, activeMode, direction, uid);
     } catch (e: any) {
       addToast('Translation failed: ' + e.message, 'error');
       outputText.set('');
@@ -76,23 +102,31 @@
     }
   }
 
-  async function fetchExplanation(input: string, output: string, mode: TranslationMode) {
+  async function fetchAndSave(
+    input: string, output: string,
+    mode: TranslationMode, dir: TranslationDirection, uid: string
+  ) {
     explanationLoading = true;
-    explanationVisible = false;
+    let exp: TranslationExplanation | null = null;
     try {
-      await new Promise(r => setTimeout(r, 400)); // brief breath
-      const result = await explainTranslation(input, output, mode);
-      explanation        = result;
+      exp = await explainTranslation(input, output, mode, dir);
+      explanation        = exp;
       explanationVisible = true;
     } catch (e: any) {
-      // explanation is non-critical — fail silently
       console.warn('Explanation failed:', e.message);
     } finally {
       explanationLoading = false;
     }
+    try {
+      const saved = await saveTranslation(uid, input, output, mode, exp);
+      historyItems.update(items => [saved, ...items]);
+      addToast('Translation saved!', 'success');
+    } catch (e: any) {
+      addToast('Failed to save: ' + e.message, 'error');
+    }
   }
 
-  // ── History preview ───────────────────────────────────
+  // ── Preview ───────────────────────────────────────────
   function handleHistoryClick(item: Translation) {
     if (previewItem?.id === item.id) { closePreview(); return; }
     previewItem    = item;
@@ -111,22 +145,26 @@
     inputText.set(previewItem.inputText);
     outputText.set(previewItem.outputText);
     selectedMode.set(previewItem.mode);
-    explanation        = null;
-    explanationVisible = false;
+    activeMode         = previewItem.mode;
+    direction          = 'forward';
+    explanation        = previewItem.explanation ?? null;
+    explanationVisible = !!previewItem.explanation;
     restoring          = false;
     closePreview();
     addToast('Translation restored to editor', 'success');
   }
 
-  // ── CSV Export ────────────────────────────────────────
+  // ── CSV ───────────────────────────────────────────────
   function exportCSV() {
     const items = get(historyItems);
     if (!items.length) { addToast('No history to export.', 'info'); return; }
-    const header = ['Date', 'Mode', 'Input', 'Output'];
+    const header = ['Date', 'Mode', 'Input', 'Output', 'Context', 'Tone'];
     const rows   = items.map(t => [
       new Date(t.createdAt).toISOString(), t.mode,
       `"${t.inputText.replace(/"/g,'""')}"`,
-      `"${t.outputText.replace(/"/g,'""')}"`
+      `"${t.outputText.replace(/"/g,'""')}"`,
+      `"${t.explanation?.context?.replace(/"/g,'""') ?? ''}"`,
+      `"${t.explanation?.tone?.replace(/"/g,'""') ?? ''}"`
     ]);
     const csv  = [header, ...rows].map(r => r.join(',')).join('\n');
     const blob = new Blob([csv], { type: 'text/csv' });
@@ -137,10 +175,13 @@
     addToast('CSV exported!', 'success');
   }
 
-  onMount(() => { loadHistory(true); });
+  onMount(async () => {
+    await tick();
+    loadHistory(true);
+  });
 </script>
 
-<!-- ── Toasts ─────────────────────────────────────────── -->
+<!-- Toasts -->
 <div class="toast-container">
   {#each $toasts as toast (toast.id)}
     <div class="toast toast--{toast.type}">{toast.message}</div>
@@ -148,17 +189,17 @@
 </div>
 
 <div class="app-shell">
-  <button class="sidebar-toggle" onclick={() => sidebarOpen.update(v => !v)}>
-    {$sidebarOpen ? '◀' : '▶'}
-  </button>
+  {#if !$sidebarOpen}
+  <button class="sidebar-toggle" onclick={() => sidebarOpen.update(v => !v)}>▶</button>
+{/if}
 
-  <!-- ── Sidebar ────────────────────────────────────── -->
-  {#if $sidebarOpen}
-    <aside class="sidebar">
-      <div class="sidebar-header">
-        <h2>History</h2>
-        <button class="btn btn--ghost btn--sm" onclick={exportCSV}>Export CSV</button>
-      </div>
+{#if $sidebarOpen}
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <button class="sidebar-close" onclick={() => sidebarOpen.update(v => !v)}>◀</button>
+      <h2>History</h2>
+      <button class="btn btn--ghost btn--sm" onclick={exportCSV}>Export CSV</button>
+    </div>
       <div class="sidebar-list">
         {#if $historyLoading && !$historyItems.length}
           <p class="sidebar-empty">Loading…</p>
@@ -188,7 +229,7 @@
     </aside>
   {/if}
 
-  <!-- ── Main ──────────────────────────────────────── -->
+  <!-- Main -->
   <main class="main">
     <header class="main-header">
       <h1 class="logo">Cheve</h1>
@@ -196,32 +237,59 @@
     </header>
 
     <div class="card">
-      <!-- Mode selector -->
-      <div class="mode-selector">
+
+      <!-- ── Dialect switcher ── -->
+      <div class="dialect-switcher">
         {#each MODES as m}
-          <button
-            class="mode-btn"
-            class:mode-btn--active={$selectedMode === m.value}
-            onclick={() => selectedMode.set(m.value)}
-          >{m.label}</button>
+          <div class="dialect-pair" class:dialect-pair--active={activeMode === m.value}>
+            <button
+              class="dialect-btn"
+              class:dialect-btn--active={activeMode === m.value}
+              onclick={() => selectMode(m.value)}
+            >
+              {#if activeMode === m.value}
+                <!-- active: show animated from→to with swap button -->
+                <span class="dialect-from">{direction === 'forward' ? m.forward : m.reverse}</span>
+                <button
+                  class="swap-btn"
+                  class:swap-btn--spinning={swapping}
+                  onclick={(e) => { e.stopPropagation(); swapDirection(); }}                  title="Swap direction"
+                >
+                  ⇄
+                </button>
+                <span class="dialect-to">{direction === 'forward' ? m.reverse : m.forward}</span>
+              {:else}
+                <!-- inactive: show static label -->
+                <span class="dialect-label">{m.forward} ↔ {m.reverse}</span>
+              {/if}
+            </button>
+          </div>
         {/each}
+      </div>
+
+      <!-- Direction indicator -->
+      <div class="direction-indicator">
+        <span class="direction-from">{currentLabels().from}</span>
+        <span class="direction-arrow">→</span>
+        <span class="direction-to">{currentLabels().to}</span>
       </div>
 
       <!-- Text panels -->
       <div class="panels">
         <div class="panel">
-          <label for="input">Input</label>
-          <textarea id="input" bind:value={$inputText} placeholder="Type your text here…" rows={6}></textarea>
+          <label for="input">{currentLabels().from}</label>
+          <textarea id="input" bind:value={$inputText}
+            placeholder="Type in {currentLabels().from}…" rows={6}></textarea>
         </div>
         <div class="panel">
-          <label for="output">Translation</label>
+          <label for="output">{currentLabels().to}</label>
           <textarea id="output" readonly value={$outputText}
-            placeholder={$isTranslating ? 'Translating…' : 'Translation will appear here…'}
+            placeholder={$isTranslating ? 'Translating…' : `${currentLabels().to} translation…`}
             rows={6}></textarea>
         </div>
       </div>
 
-      <!-- ── Cultural Explanation ────────────────────── -->
+      <!-- Explanation loading -->
       {#if explanationLoading}
         <div class="explanation explanation--loading">
           <span class="explanation-pulse"></span>
@@ -229,23 +297,28 @@
         </div>
       {/if}
 
+      <!-- Explanation -->
       {#if explanation && !explanationLoading}
         <div class="explanation" class:explanation--visible={explanationVisible}>
           <div class="explanation-header">
             <span class="explanation-icon">◈</span>
             <span class="explanation-label">Cultural Notes</span>
-            <span class="explanation-tone">{explanation.tone}</span>
+            {#if explanation.tone}
+              <span class="explanation-tone">{explanation.tone}</span>
+            {/if}
           </div>
-
-          <p class="explanation-context">{explanation.context}</p>
-
-          {#if explanation.annotations.length}
+          {#if explanation.context}
+            <p class="explanation-context">{explanation.context}</p>
+          {/if}
+          {#if explanation.annotations?.length}
             <div class="annotations">
               {#each explanation.annotations as ann}
                 <div class="annotation">
                   <span class="annotation-word">{ann.word}</span>
                   <span class="annotation-meaning">{ann.meaning}</span>
-                  <p class="annotation-note">{ann.note}</p>
+                  {#if ann.note && ann.note !== ann.meaning}
+                    <p class="annotation-note">{ann.note}</p>
+                  {/if}
                 </div>
               {/each}
             </div>
@@ -253,7 +326,7 @@
         </div>
       {/if}
 
-      <!-- History preview panel -->
+      <!-- History preview -->
       {#if previewItem}
         <div class="preview-panel" class:preview-panel--visible={previewVisible}>
           <div class="preview-header">
@@ -272,6 +345,33 @@
               <p class="preview-text">{previewItem.outputText}</p>
             </div>
           </div>
+          {#if previewItem.explanation}
+            <div class="preview-explanation">
+              <div class="explanation-header">
+                <span class="explanation-icon">◈</span>
+                <span class="explanation-label">Cultural Notes</span>
+                {#if previewItem.explanation.tone}
+                  <span class="explanation-tone">{previewItem.explanation.tone}</span>
+                {/if}
+              </div>
+              {#if previewItem.explanation.context}
+                <p class="explanation-context">{previewItem.explanation.context}</p>
+              {/if}
+              {#if previewItem.explanation.annotations?.length}
+                <div class="annotations">
+                  {#each previewItem.explanation.annotations as ann}
+                    <div class="annotation">
+                      <span class="annotation-word">{ann.word}</span>
+                      <span class="annotation-meaning">{ann.meaning}</span>
+                      {#if ann.note && ann.note !== ann.meaning}
+                        <p class="annotation-note">{ann.note}</p>
+                      {/if}
+                    </div>
+                  {/each}
+                </div>
+              {/if}
+            </div>
+          {/if}
           <div class="btn-row">
             <button class="btn btn--primary" onclick={restoreFromPreview} disabled={restoring}>
               {restoring ? 'Restoring…' : '↩ Restore to editor'}
@@ -280,7 +380,7 @@
         </div>
       {/if}
 
-      <!-- Translate button -->
+      <!-- Translate -->
       <div class="btn-row">
         <button class="btn btn--primary btn--translate" onclick={handleTranslate} disabled={$isTranslating}>
           {$isTranslating ? 'Translating…' : 'Translate'}
@@ -292,14 +392,14 @@
 
 <style>
   :global(*, *::before, *::after) { box-sizing: border-box; margin: 0; padding: 0; }
+  :global(html, body) { height: 100%; overflow: hidden; }
   :global(body) {
     font-family: 'Georgia', serif;
     background: #1c1814;
     color: #ede8e0;
-    min-height: 100vh;
   }
 
-  .app-shell { display: flex; min-height: 100vh; }
+  .app-shell { display: flex; height: 100vh; overflow: hidden; }
 
   /* ── Sidebar ── */
   .sidebar {
@@ -307,17 +407,15 @@
     background: #221e19;
     border-right: 1px solid #362e24;
     display: flex; flex-direction: column;
-    overflow: hidden;
+    height: 100vh; overflow: hidden;
   }
   .sidebar-header {
     display: flex; align-items: center; justify-content: space-between;
     padding: 1.25rem 1rem;
     border-bottom: 1px solid #362e24;
+    flex-shrink: 0;
   }
-  .sidebar-header h2 {
-    font-size: 0.8rem; text-transform: uppercase;
-    letter-spacing: 0.14em; color: #9a8e7e;
-  }
+  .sidebar-header h2 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.14em; color: #9a8e7e; }
   .sidebar-list { flex: 1; overflow-y: auto; padding: 0.5rem 0; }
   .sidebar-empty { padding: 2rem 1rem; color: #6a5e4e; font-size: 0.875rem; text-align: center; }
 
@@ -346,8 +444,38 @@
   }
   .sidebar-toggle:hover { background: #dba55e; }
 
+  .sidebar-close {
+  background: none;
+  border: none;
+  color: #6a5e4e;
+  cursor: pointer;
+  font-size: 0.85rem;
+  padding: 0.25rem 0.4rem;
+  border-radius: 4px;
+  transition: color 0.15s, background 0.15s;
+  flex-shrink: 0;
+}
+.sidebar-close:hover { color: #c8954a; background: #c8954a14; }
+
+.sidebar-toggle {
+  position: fixed;
+  top: 1.25rem;
+  left: 1rem;
+  z-index: 100;
+  background: #c8954a;
+  color: #1c1814;
+  border: none;
+  border-radius: 4px;
+  width: 2rem;
+  height: 2rem;
+  cursor: pointer;
+  font-size: 0.75rem;
+  transition: background 0.15s;
+}
+.sidebar-toggle:hover { background: #dba55e; }
+
   /* ── Main ── */
-  .main { flex: 1; padding: 3rem 2rem 2rem; max-width: 900px; margin: 0 auto; width: 100%; }
+  .main { flex: 1; height: 100vh; overflow-y: auto; padding: 3rem 2rem 2rem; }
   .main-header { text-align: center; margin-bottom: 2.5rem; }
   .logo { font-size: 3.5rem; font-weight: 400; letter-spacing: 0.05em; color: #ede8e0; }
   .tagline { font-size: 0.8rem; color: #7a6e5e; margin-top: 0.3rem; text-transform: uppercase; letter-spacing: 0.18em; }
@@ -357,18 +485,80 @@
     background: #211d18; border: 1px solid #362e24;
     border-radius: 10px; padding: 1.75rem;
     display: flex; flex-direction: column; gap: 1.5rem;
+    max-width: 860px; margin: 0 auto;
   }
 
-  /* ── Mode selector ── */
-  .mode-selector { display: flex; gap: 0.5rem; flex-wrap: wrap; justify-content: center; }
-  .mode-btn {
-    padding: 0.4rem 1.1rem; border: 1px solid #362e24;
-    border-radius: 100px; background: none;
-    color: #9a8e7e; font-size: 0.8rem; font-family: inherit;
-    cursor: pointer; transition: all 0.15s;
+  /* ── Dialect switcher ── */
+  .dialect-switcher {
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    justify-content: center;
   }
-  .mode-btn:hover { border-color: #c8954a; color: #c8954a; }
-  .mode-btn--active { background: #c8954a; border-color: #c8954a; color: #1c1814; font-weight: 600; }
+
+  .dialect-pair { display: flex; }
+
+  .dialect-btn {
+    display: flex; align-items: center; gap: 0.5rem;
+    padding: 0.45rem 1rem;
+    border: 1px solid #362e24;
+    border-radius: 100px;
+    background: none;
+    color: #9a8e7e;
+    font-size: 0.8rem;
+    font-family: inherit;
+    cursor: pointer;
+    transition: all 0.2s;
+    white-space: nowrap;
+  }
+  .dialect-btn:hover { border-color: #c8954a; color: #c8954a; }
+  .dialect-btn--active {
+    background: #2a211a;
+    border-color: #c8954a;
+    color: #ede8e0;
+  }
+
+  .dialect-label { color: inherit; }
+
+  .dialect-from {
+    color: #c8954a;
+    font-weight: 600;
+    font-size: 0.8rem;
+    transition: all 0.3s;
+  }
+
+  .dialect-to {
+    color: #dba55e;
+    font-size: 0.8rem;
+    transition: all 0.3s;
+  }
+
+  /* swap button */
+  .swap-btn {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 1.4rem; height: 1.4rem;
+    background: #c8954a22;
+    border: 1px solid #c8954a66;
+    border-radius: 50%;
+    color: #c8954a;
+    font-size: 0.85rem;
+    cursor: pointer;
+    transition: background 0.15s, transform 0.35s ease;
+    flex-shrink: 0;
+    padding: 0;
+    line-height: 1;
+  }
+  .swap-btn:hover { background: #c8954a44; }
+  .swap-btn--spinning { transform: rotate(180deg); }
+
+  /* ── Direction indicator ── */
+  .direction-indicator {
+    display: flex; align-items: center; justify-content: center; gap: 0.6rem;
+    font-size: 0.8rem; color: #6a5e4e;
+  }
+  .direction-from { color: #c8954a; font-weight: 600; }
+  .direction-to   { color: #dba55e; }
+  .direction-arrow { color: #4a3e2e; }
 
   /* ── Text panels ── */
   .panels { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
@@ -383,59 +573,41 @@
   }
   .panel textarea:focus { border-color: #c8954a; }
 
-  /* ── Cultural Explanation ── */
+  /* ── Explanation ── */
   .explanation {
-    background: #18140f;
-    border: 1px solid #c8954a33;
-    border-left: 3px solid #c8954a;
-    border-radius: 8px;
+    background: #18140f; border: 1px solid #c8954a33;
+    border-left: 3px solid #c8954a; border-radius: 8px;
     padding: 1.25rem 1.5rem;
     display: flex; flex-direction: column; gap: 1rem;
     opacity: 0; transform: translateY(6px);
     transition: opacity 0.35s ease, transform 0.35s ease;
   }
   .explanation--visible { opacity: 1; transform: translateY(0); }
-
   .explanation--loading {
     opacity: 1; transform: none;
     flex-direction: row; align-items: center; gap: 0.75rem;
     padding: 0.9rem 1.5rem;
   }
-
   .explanation-pulse {
-    display: inline-block;
-    width: 8px; height: 8px; border-radius: 50%;
-    background: #c8954a;
+    display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    background: #c8954a; flex-shrink: 0;
     animation: pulse 1.2s ease-in-out infinite;
-    flex-shrink: 0;
   }
   @keyframes pulse {
     0%, 100% { opacity: 0.3; transform: scale(0.85); }
     50%       { opacity: 1;   transform: scale(1.15); }
   }
-
   .explanation-loading-text { font-size: 0.8rem; color: #7a6e5e; font-style: italic; }
-
   .explanation-header { display: flex; align-items: center; gap: 0.6rem; }
   .explanation-icon { color: #c8954a; font-size: 0.9rem; }
-  .explanation-label {
-    font-size: 0.72rem; text-transform: uppercase;
-    letter-spacing: 0.12em; color: #9a8e7e; flex: 1;
-  }
+  .explanation-label { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.12em; color: #9a8e7e; flex: 1; }
   .explanation-tone {
-    font-size: 0.72rem; font-style: italic;
-    color: #c8954a; background: #c8954a14;
-    border: 1px solid #c8954a33; border-radius: 100px;
-    padding: 0.15rem 0.65rem;
+    font-size: 0.72rem; font-style: italic; color: #c8954a;
+    background: #c8954a14; border: 1px solid #c8954a33;
+    border-radius: 100px; padding: 0.15rem 0.65rem;
   }
-
-  .explanation-context {
-    font-size: 0.9rem; color: #c8bfb0;
-    line-height: 1.65; font-style: italic;
-  }
-
+  .explanation-context { font-size: 0.9rem; color: #c8bfb0; line-height: 1.65; font-style: italic; }
   .annotations { display: flex; flex-direction: column; gap: 0.75rem; }
-
   .annotation {
     display: grid;
     grid-template-columns: auto auto 1fr;
@@ -443,22 +615,9 @@
     column-gap: 0.6rem; row-gap: 0.2rem;
     align-items: baseline;
   }
-
-  .annotation-word {
-    font-size: 0.92rem; font-weight: 600;
-    color: #dba55e; grid-row: 1;
-  }
-  .annotation-meaning {
-    font-size: 0.78rem; color: #7a6e5e;
-    font-style: italic; grid-row: 1;
-    padding-top: 0.05rem;
-  }
-  .annotation-note {
-    font-size: 0.82rem; color: #a09488;
-    line-height: 1.55;
-    grid-column: 1 / -1; grid-row: 2;
-    padding-left: 0.1rem;
-  }
+  .annotation-word { font-size: 0.92rem; font-weight: 600; color: #dba55e; grid-row: 1; }
+  .annotation-meaning { font-size: 0.78rem; color: #7a6e5e; font-style: italic; grid-row: 1; }
+  .annotation-note { font-size: 0.82rem; color: #a09488; line-height: 1.55; grid-column: 1 / -1; grid-row: 2; }
 
   /* ── Preview panel ── */
   .preview-panel {
@@ -470,7 +629,6 @@
     pointer-events: none;
   }
   .preview-panel--visible { opacity: 1; transform: translateY(0); pointer-events: all; }
-
   .preview-header { display: flex; align-items: center; gap: 0.75rem; }
   .preview-badge {
     font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.1em;
@@ -480,12 +638,12 @@
   .preview-date { font-size: 0.72rem; color: #6a5e4e; flex: 1; }
   .preview-close { background: none; border: none; color: #6a5e4e; cursor: pointer; font-size: 0.85rem; transition: color 0.15s; }
   .preview-close:hover { color: #ede8e0; }
-
   .preview-body { display: grid; grid-template-columns: 1fr auto 1fr; gap: 1rem; align-items: start; }
   .preview-col { display: flex; flex-direction: column; gap: 0.4rem; }
   .preview-col-label { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.1em; color: #7a6e5e; }
   .preview-text { font-size: 0.875rem; color: #c8bfb0; line-height: 1.6; }
   .preview-divider { width: 1px; background: #362e24; align-self: stretch; margin-top: 1.25rem; }
+  .preview-explanation { display: flex; flex-direction: column; gap: 0.6rem; padding-top: 0.75rem; border-top: 1px solid #362e24; }
 
   /* ── Buttons ── */
   .btn-row { display: flex; justify-content: center; }

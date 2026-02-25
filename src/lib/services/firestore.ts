@@ -8,11 +8,11 @@ import {
   startAfter,
   getDocs,
   serverTimestamp,
-  type DocumentSnapshot,
   type QueryDocumentSnapshot
 } from 'firebase/firestore';
 import { db } from '$lib/firebase';
 import type { TranslationMode } from './gemini';
+import type { TranslationExplanation } from './gemini';
 
 export interface Translation {
   id: string;
@@ -20,6 +20,7 @@ export interface Translation {
   inputText: string;
   outputText: string;
   mode: TranslationMode;
+  explanation: TranslationExplanation | null;
   createdAt: Date;
 }
 
@@ -35,13 +36,15 @@ export async function saveTranslation(
   userId: string,
   inputText: string,
   outputText: string,
-  mode: TranslationMode
+  mode: TranslationMode,
+  explanation: TranslationExplanation | null = null
 ): Promise<Translation> {
   const docRef = await addDoc(collection(db, 'translations'), {
     userId,
     inputText,
     outputText,
     mode,
+    explanation,
     createdAt: serverTimestamp()
   });
 
@@ -51,6 +54,7 @@ export async function saveTranslation(
     inputText,
     outputText,
     mode,
+    explanation,
     createdAt: new Date()
   };
 }
@@ -91,6 +95,7 @@ export async function getTranslations(
       inputText: data.inputText,
       outputText: data.outputText,
       mode: data.mode,
+      explanation: data.explanation ?? null,
       createdAt: data.createdAt?.toDate?.() ?? new Date()
     };
   });
