@@ -95,7 +95,7 @@ Translation: "${output}"
 CONTEXT:`;
 };
 
-async function callGemini(prompt: string, maxTokens = 1024): Promise<string> {
+async function callGemini(prompt: string, maxTokens = 2500): Promise<string> {
   if (!GEMINI_API_KEY) {
     throw new Error('VITE_GEMINI_API_KEY is not set in environment variables.');
   }
